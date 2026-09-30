@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # wg-client-manager.sh
-# Versao    : 1.6.0 (2026-09-29)
+# Versao    : 1.6.2 (2026-09-29)
 # Projeto   : EdenCore - Comunidade de Infraestrutura de TI
 # Instrutor : Daniel Selbach Figueiró
 # Funcao    : criar e gerenciar clientes WireGuard (wg-quick) via menu interativo.
@@ -49,6 +49,11 @@
 #            usam "wg set" e rota blackhole temporaria (iproute2), com
 #            remocao automatica ao fim, em erro ou Ctrl+C.
 #          O script nunca cria, altera ou remove regras de firewall.
+#   1.6.1  Limite minimo do watchdog calculado pelo keepalive
+#          (120s de rekey + keepalive + 30s de margem). Evita reinicio falso
+#          em tunel saudavel; status alerta limites abaixo do seguro.
+#   1.6.2  Status mostra a proxima execucao do timer (gatilho monotonico nao
+#          preenche NextElapseUSecRealtime; lido via list-timers).
 #
 # Modo nao interativo: sh wg-client-manager.sh --help
 #
@@ -82,7 +87,7 @@ umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION="1.6.0"
+VERSION="1.6.2"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 LOG_DIR="${WG_LOG_DIR:-/var/log/wg-client-manager}"
 DYN_CTRL="/sys/kernel/debug/dynamic_debug/control"
@@ -1702,6 +1707,15 @@ remove_agent() {
     msg_ok "Agente removido. Tuneis e configuracoes de monitoramento foram mantidos."
 }
 
+# Com trafego, o WireGuard renova o handshake apos 120s (REKEY_AFTER_TIME), no
+# proximo pacote. Com keepalive K, a idade normal chega a 120+K. Margem: 30s.
+hs_min_safe() {
+    _k=$(conf_get PersistentKeepalive "$WG_DIR/$1/$1.conf")
+    case "$_k" in ''|*[!0-9]*) _k=0 ;; esac
+    _m=$((120 + _k + 30)); [ "$_m" -lt 180 ] && _m=180
+    printf '%s' "$_m"
+}
+
 monitor_enable() {
     select_tunnel _me || return 1
     _ka=$(conf_get PersistentKeepalive "$WG_DIR/$_me/$_me.conf")
@@ -1712,9 +1726,10 @@ monitor_enable() {
         _wd=0
     fi
     while :; do
-        ask _hsm "Reiniciar se sem handshake por mais de N segundos (150-3600)" "180"
-        case "$_hsm" in ''|*[!0-9]*) ;; *) [ "$_hsm" -ge 150 ] && [ "$_hsm" -le 3600 ] && break ;; esac
-        msg_err "Valor entre 150 e 3600 (rekey do WireGuard ocorre a cada ~120s)."
+        _hmin=$(hs_min_safe "$_me")
+        ask _hsm "Reiniciar se sem handshake por mais de N segundos (${_hmin}-3600)" "$_hmin"
+        case "$_hsm" in ''|*[!0-9]*) ;; *) [ "$_hsm" -ge "$_hmin" ] && [ "$_hsm" -le 3600 ] && break ;; esac
+        msg_err "Valor entre ${_hmin} e 3600: com keepalive atual, handshake saudavel chega a $((_hmin - 30))s."
     done
     parse_endpoint "$_me"
     _dd=1; valid_ip "$_ep_host" && _dd=0
@@ -1742,7 +1757,8 @@ monitor_status() {
     if agent_installed; then
         msg_ok "Agente instalado: $("$AGENT_BIN" --version 2>/dev/null) | script atual: v$VERSION"
         if [ "$(init_system)" = "systemd" ]; then
-            msg_info "Timer: $(systemctl is-active "$UNIT_NAME.timer" 2>/dev/null) | proxima: $(systemctl show -p NextElapseUSecRealtime --value "$UNIT_NAME.timer" 2>/dev/null)"
+            _nx=$(systemctl list-timers --all --no-legend --no-pager "$UNIT_NAME.timer" 2>/dev/null | awk 'NR==1{print $1, $2, $3, $4}')
+            msg_info "Timer: $(systemctl is-active "$UNIT_NAME.timer" 2>/dev/null) | proxima execucao: ${_nx:-n/d}"
         fi
     else
         msg_warn "Agente NAO instalado: DDNS e watchdog nao estao rodando."
@@ -1762,8 +1778,15 @@ monitor_status() {
             _st="DOWN"; _sa="-"; _se="-"
         fi
         [ -f "$_sd/.admin-down" ] && _st="ADM-OFF"
+        if [ "$(monitor_get "$_sn" HS_MAX 180)" -lt "$(hs_min_safe "$_sn")" ]; then
+            _lowhs="${_lowhs:-}$_sn (limite $(monitor_get "$_sn" HS_MAX 180)s < seguro $(hs_min_safe "$_sn")s) "
+        fi
         printf '%-16s %-6s %-5s %-5s %-9s %s\n' "$_sn" "$_st" "$(monitor_get "$_sn" DDNS 0)" "$(monitor_get "$_sn" WATCHDOG 0)" "$_sa" "$_se"
     done
+    if [ -n "${_lowhs:-}" ]; then
+        msg_warn "Limite de watchdog abaixo do seguro: ${_lowhs}. Reative pelo menu 15 > 1."
+        _lowhs=""
+    fi
     printf '\nUltimos eventos (%s/maintenance.log):\n' "$LOG_DIR"
     tail -n 10 "$LOG_DIR/maintenance.log" 2>/dev/null || printf '  (sem eventos)\n'
 }
@@ -2175,7 +2198,7 @@ cli_create() {
     if [ "$OPT_MON" -eq 1 ]; then
         _dd=1; valid_ip "$_h" && _dd=0
         _wd=1; [ "$KA" -eq 0 ] && _wd=0
-        _mc=$(printf 'ENABLED=1\nHS_MAX=180\nDDNS=%s\nWATCHDOG=%s\nBACKOFF=300' "$_dd" "$_wd")
+        _mc=$(printf 'ENABLED=1\nHS_MAX=%s\nDDNS=%s\nWATCHDOG=%s\nBACKOFF=300' "$(hs_min_safe "$TUN")" "$_dd" "$_wd")
         if [ "$(cat "$_dir/monitor.conf" 2>/dev/null)" != "$_mc" ]; then
             printf '%s\n' "$_mc" > "$_dir/monitor.conf"; chmod 600 "$_dir/monitor.conf"; _changed=1
         fi
