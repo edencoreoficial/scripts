@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # wg-client-manager.sh
-# Versao    : 1.5.0 (2026-09-29)
+# Versao    : 1.5.1 (2026-09-29)
 # Projeto   : EdenCore - Comunidade de Infraestrutura de TI
 # Instrutor : Daniel Selbach Figueiró
 # Funcao    : criar e gerenciar clientes WireGuard (wg-quick) via menu interativo.
@@ -40,6 +40,9 @@
 #          - Teste de MTU ate o endpoint (DF bit) com sugestao e aplicacao.
 #          - Modo nao interativo idempotente (--create ...) p/ Ansible/scripts.
 #          - Retencao configuravel de relatorios de debug.
+#   1.5.1  Trilha de auditoria: instalacao/remocao do agente e ativacao/
+#          desativacao de monitoramento registradas no maintenance.log
+#          (arquivo existe desde a instalacao, mesmo sem incidentes).
 #
 # Modo nao interativo: sh wg-client-manager.sh --help
 #
@@ -73,7 +76,7 @@ umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 LOG_DIR="${WG_LOG_DIR:-/var/log/wg-client-manager}"
 DYN_CTRL="/sys/kernel/debug/dynamic_debug/control"
@@ -1606,6 +1609,7 @@ install_agent() {
         fi
     fi
     msg_ok "Agente v$VERSION em $AGENT_BIN (root, 700)."
+    mlog global "agente v$VERSION instalado em $AGENT_BIN" >/dev/null
 
     if [ "$(init_system)" = "systemd" ]; then
         cat > "$UNIT_DIR/$UNIT_NAME.service" <<EOF
@@ -1673,6 +1677,7 @@ remove_agent() {
         grep -v "$AGENT_BIN --maintenance" /etc/crontabs/root > /etc/crontabs/root.tmp && mv /etc/crontabs/root.tmp /etc/crontabs/root
     fi
     rm -f "$AGENT_BIN"
+    mlog global "agente removido" >/dev/null
     msg_ok "Agente removido. Tuneis e configuracoes de monitoramento foram mantidos."
 }
 
@@ -1695,6 +1700,7 @@ monitor_enable() {
     printf 'ENABLED=1\nHS_MAX=%s\nDDNS=%s\nWATCHDOG=%s\nBACKOFF=300\n' "$_hsm" "$_dd" "$_wd" > "$WG_DIR/$_me/monitor.conf"
     chmod 600 "$WG_DIR/$_me/monitor.conf"
     msg_ok "Monitoramento ativo em '$_me' (DDNS=$_dd, WATCHDOG=$_wd, limite=${_hsm}s)."
+    mlog "$_me" "monitoramento ativado (DDNS=$_dd, WATCHDOG=$_wd, limite=${_hsm}s)" >/dev/null
     [ "$_dd" -eq 0 ] && msg_info "Endpoint e IP fixo ($_ep_host): re-resolucao DDNS nao se aplica."
     if agent_installed; then
         msg_info "Agente ja instalado. Se atualizou o script, reinstale pela opcao 5 para alinhar a versao."
@@ -1706,6 +1712,7 @@ monitor_enable() {
 monitor_disable() {
     select_tunnel _md || return 1
     rm -f "$WG_DIR/$_md/monitor.conf"
+    mlog "$_md" "monitoramento desativado" >/dev/null
     msg_ok "Monitoramento desativado em '$_md'."
 }
 
