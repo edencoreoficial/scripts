@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # wg-client-manager.sh
-# Versao    : 1.5.1 (2026-09-29)
+# Versao    : 1.6.0 (2026-09-29)
 # Projeto   : EdenCore - Comunidade de Infraestrutura de TI
 # Instrutor : Daniel Selbach Figueiró
 # Funcao    : criar e gerenciar clientes WireGuard (wg-quick) via menu interativo.
@@ -43,6 +43,12 @@
 #   1.5.1  Trilha de auditoria: instalacao/remocao do agente e ativacao/
 #          desativacao de monitoramento registradas no maintenance.log
 #          (arquivo existe desde a instalacao, mesmo sem incidentes).
+#   1.6.0  Agnostico a firewall local (ufw, firewalld, nftables, iptables):
+#          - Deteccao e exibicao do firewall local (diagnostico e relatorio).
+#          - Testes controlados de DDNS e watchdog sem tocar no firewall:
+#            usam "wg set" e rota blackhole temporaria (iproute2), com
+#            remocao automatica ao fim, em erro ou Ctrl+C.
+#          O script nunca cria, altera ou remove regras de firewall.
 #
 # Modo nao interativo: sh wg-client-manager.sh --help
 #
@@ -76,7 +82,7 @@ umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION="1.5.1"
+VERSION="1.6.0"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 LOG_DIR="${WG_LOG_DIR:-/var/log/wg-client-manager}"
 DYN_CTRL="/sys/kernel/debug/dynamic_debug/control"
@@ -115,11 +121,24 @@ debug_off() {
     fi
     DEBUG_ACTIVE=0
 }
+# Estado de testes controlados: desfeito em qualquer saida do script.
+TEST_ROUTE=""; TEST_ROUTE_FAM=""; TEST_EP_TUN=""; TEST_EP_PEER=""; TEST_EP_ORIG=""
+test_cleanup() {
+    if [ -n "$TEST_ROUTE" ]; then
+        ip "$TEST_ROUTE_FAM" route del blackhole "$TEST_ROUTE" 2>/dev/null
+        TEST_ROUTE=""
+    fi
+    if [ -n "$TEST_EP_TUN" ] && [ -n "$TEST_EP_ORIG" ]; then
+        wg set "$TEST_EP_TUN" peer "$TEST_EP_PEER" endpoint "$TEST_EP_ORIG" 2>/dev/null
+        TEST_EP_TUN=""
+    fi
+}
+
 release_lock() {
     if [ "$LOCK_HELD" -eq 1 ]; then rm -rf "$LOCK_DIR"; LOCK_HELD=0; fi
 }
-trap 'debug_off; release_lock' EXIT
-trap 'restore_tty; debug_off; release_lock; printf "\n"; exit 130' INT TERM
+trap 'test_cleanup; debug_off; release_lock' EXIT
+trap 'restore_tty; test_cleanup; debug_off; release_lock; printf "\n"; exit 130' INT TERM
 
 pause() {
     printf '\nPressione Enter para continuar...'
@@ -307,6 +326,7 @@ check_install() {
     if kernel_support; then msg_ok "Suporte WireGuard no kernel (ou wireguard-go) disponivel."
     else msg_warn "Modulo wireguard indisponivel. Kernel < 5.6 exige wireguard-dkms ou wireguard-go."; fi
 
+    msg_info "Firewall local: $(detect_firewall)"
     if command -v resolvconf >/dev/null 2>&1; then msg_ok "resolvconf encontrado (diretiva DNS funcional)."
     else msg_warn "resolvconf ausente: tuneis com DNS vao falhar no wg-quick."; fi
 
@@ -1197,7 +1217,8 @@ debug_capture() {
         printf 'OS: %s\n' "$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-n/d}") )"
         printf 'Kernel: %s | lockdown: %s | init: %s\n' "$(uname -r)" "$(lockdown_state)" "$(init_system)"
         printf 'wg: %s\n' "$(wg --version 2>/dev/null | head -n1)"
-        printf 'Kernel debug: %s | tcpdump: %s\n\n' "$_kdebug" "$([ -n "$_tpid" ] && echo 1 || echo 0)"
+        printf 'Kernel debug: %s | tcpdump: %s\n' "$_kdebug" "$([ -n "$_tpid" ] && echo 1 || echo 0)"
+        printf 'Firewall local: %s\n\n' "$(detect_firewall)"
         printf '== Configuracao (chaves ocultas) ==\n'
         mask_secrets < "$WG_DIR/$_dt/$_dt.conf"
         printf '\n== Estado WireGuard (final) ==\n'
@@ -1747,6 +1768,157 @@ monitor_status() {
     tail -n 10 "$LOG_DIR/maintenance.log" 2>/dev/null || printf '  (sem eventos)\n'
 }
 
+# ----------------------------------------------------------------------------
+# Firewall local (somente leitura) e testes controlados
+# ----------------------------------------------------------------------------
+# ufw e firewalld sao front-ends; por baixo o kernel usa nftables ou iptables
+# (legacy ou nf_tables). O script apenas LE esse estado para diagnostico.
+detect_firewall() {
+    _fw=""
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -qi 'status: active'; then _fw="ufw (ativo)"; else _fw="ufw (inativo)"; fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if firewall-cmd --state >/dev/null 2>&1; then _f2="firewalld (ativo)"; else _f2="firewalld (inativo)"; fi
+        _fw="${_fw:+$_fw, }$_f2"
+    fi
+    _be=""
+    if command -v iptables >/dev/null 2>&1; then
+        case "$(iptables -V 2>/dev/null)" in
+            *nf_tables*) _be="iptables-nft" ;;
+            *legacy*)    _be="iptables-legacy" ;;
+            *)           _be="iptables" ;;
+        esac
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        _nr=$(nft list ruleset 2>/dev/null | grep -c '^table')
+        _be="${_be:+$_be, }nftables ($_nr tabela(s))"
+    fi
+    printf '%s' "${_fw:-sem front-end (ufw/firewalld)}${_be:+ | backend: $_be}"
+}
+
+log_lines() {
+    if [ -f "$LOG_DIR/maintenance.log" ]; then wc -l < "$LOG_DIR/maintenance.log" | tr -d ' '; else printf '0'; fi
+}
+log_new()   { tail -n +"$(( $1 + 1 ))" "$LOG_DIR/maintenance.log" 2>/dev/null; }
+
+test_preflight() {
+    if ! agent_installed; then msg_err "Agente nao instalado (menu 15 > 5)."; return 1; fi
+    if [ "$(monitor_get "$1" ENABLED 0)" != "1" ]; then msg_err "Monitoramento inativo em '$1' (menu 15 > 1)."; return 1; fi
+    if ! tunnel_is_up "$1"; then msg_err "Tunel '$1' inativo."; return 1; fi
+    return 0
+}
+
+# Teste de DDNS: aponta o endpoint para um IP de documentacao (RFC 5737/3849)
+# e espera o agente re-resolver o nome. Nao envia trafego a terceiros.
+test_ddns() {
+    select_tunnel _td || return 1
+    test_preflight "$_td" || return 1
+    parse_endpoint "$_td"
+    if valid_ip "$_ep_host" || [ "$(monitor_get "$_td" DDNS 0)" != "1" ]; then
+        msg_err "Endpoint com IP fixo ou DDNS desativado: teste nao se aplica."; return 1
+    fi
+    _peer=$(wg show "$_td" peers | head -n1)
+    _orig=$(wg show "$_td" endpoints | awk 'NR==1{print $2}')
+    case "$_orig" in \[*) _fake="[2001:db8::1]:$_ep_port" ;; *) _fake="192.0.2.1:$_ep_port" ;; esac
+
+    msg_warn "Se o SERVIDOR tiver persistent-keepalive neste peer, o roaming nativo do WireGuard"
+    msg_warn "corrige o endpoint antes do agente e o teste fica inconclusivo. No MikroTik:"
+    printf '  /interface wireguard peers print detail where public-key="%s"\n' "$(tr -d ' \t\r\n' < "$WG_DIR/$_td/publickey")"
+    msg_info "Duracao maxima: 6 min. Endpoint original restaurado ao fim, em erro ou Ctrl+C."
+    confirm "Iniciar teste de DDNS em '$_td'?" || return 0
+
+    _l0=$(log_lines)
+    TEST_EP_TUN=$_td; TEST_EP_PEER=$_peer; TEST_EP_ORIG=$_orig
+    wg set "$_td" peer "$_peer" endpoint "$_fake" || { TEST_EP_TUN=""; msg_err "Falha ao aplicar endpoint de teste."; return 1; }
+    mlog "$_td" "teste DDNS: endpoint temporario $_fake (original $_orig)" >/dev/null
+
+    _t=0; _res=""
+    while [ "$_t" -lt 360 ]; do
+        sleep 5; _t=$((_t + 5))
+        if log_new "$_l0" | grep -q 'DDNS: .*endpoint atualizado'; then _res=ok; break; fi
+        _now_ep=$(wg show "$_td" endpoints | awk 'NR==1{print $2}')
+        if [ "$_now_ep" != "$_fake" ]; then _res=roaming; break; fi
+        printf '\r  %3ss | endpoint %s' "$_t" "$_now_ep"
+    done
+    printf '\n'
+    case "$_res" in
+        ok)
+            TEST_EP_TUN=""
+            msg_ok "DDNS validado: agente re-resolveu e corrigiu o endpoint sem reiniciar."
+            log_new "$_l0" | grep 'DDNS' ;;
+        roaming)
+            TEST_EP_TUN=""
+            msg_warn "Endpoint corrigido SEM evento do agente: roaming nativo (servidor enviou pacote)."
+            msg_warn "Inconclusivo. Zere o persistent-keepalive do peer no servidor e repita." ;;
+        *)
+            test_cleanup
+            msg_err "Sem correcao em 6 min. Endpoint original restaurado. Verifique: journalctl -u $UNIT_NAME" ;;
+    esac
+    mlog "$_td" "teste DDNS finalizado: ${_res:-timeout}" >/dev/null
+}
+
+# Teste de watchdog: rota blackhole temporaria ate o endpoint (iproute2).
+# Independe de ufw/firewalld/nftables/iptables e nao altera nenhuma regra.
+test_watchdog() {
+    select_tunnel _tw || return 1
+    test_preflight "$_tw" || return 1
+    if [ "$(monitor_get "$_tw" WATCHDOG 0)" != "1" ]; then msg_err "Watchdog desativado em '$_tw'."; return 1; fi
+    _ip=$(wg show "$_tw" endpoints | awk 'NR==1{print $2}')
+    _ip=${_ip%:*}; _ip=${_ip#[}; _ip=${_ip%]}
+    valid_ip "$_ip" || { msg_err "Endpoint atual indisponivel."; return 1; }
+    case "$_ip" in *:*) _fam=-6; _pfx="$_ip/128" ;; *) _fam=-4; _pfx="$_ip/32" ;; esac
+    if ip "$_fam" route show "$_pfx" 2>/dev/null | grep -q .; then
+        msg_err "Ja existe rota especifica para $_pfx; teste abortado para nao interferir."; return 1
+    fi
+    _hsmax=$(monitor_get "$_tw" HS_MAX 180)
+    _lr=$(state_get "$_tw" last_restart 0)
+    _wait_bk=$(( $(monitor_get "$_tw" BACKOFF 300) - ($(date +%s) - _lr) ))
+    msg_warn "Durante o teste, TODO trafego deste host para $_ip fica bloqueado (rota blackhole)."
+    msg_info "Evento esperado em ~$((_hsmax + 60))s. Duracao maxima: 8 min. Rota removida ao fim, em erro ou Ctrl+C."
+    [ "$_wait_bk" -gt 0 ] && msg_info "Houve reinicio recente: o watchdog aguarda mais ${_wait_bk}s de backoff."
+    confirm "Iniciar teste de watchdog em '$_tw'?" || return 0
+
+    _l0=$(log_lines)
+    ip "$_fam" route add blackhole "$_pfx" || { msg_err "Falha ao criar rota de teste."; return 1; }
+    TEST_ROUTE=$_pfx; TEST_ROUTE_FAM=$_fam
+    mlog "$_tw" "teste watchdog: rota blackhole temporaria para $_pfx" >/dev/null
+
+    _t=0; _res=""
+    while [ "$_t" -lt 480 ]; do
+        sleep 5; _t=$((_t + 5))
+        if log_new "$_l0" | grep -q 'watchdog: tunel reiniciado'; then _res=ok; break; fi
+        if log_new "$_l0" | grep -q 'watchdog: falha'; then _res=falha; break; fi
+        _hs=$(wg show "$_tw" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+        if [ "${_hs:-0}" -gt 0 ]; then _age="$(( $(date +%s) - _hs ))s"; else _age="-"; fi
+        printf '\r  %3ss | handshake ha %s   ' "$_t" "$_age"
+    done
+    printf '\n'
+    test_cleanup
+    mlog "$_tw" "teste watchdog: rota removida" >/dev/null
+    msg_ok "Rota de teste removida."
+
+    case "$_res" in
+        ok)    msg_ok "Watchdog validado: reinicio executado pelo agente."
+               log_new "$_l0" | grep 'watchdog' ;;
+        falha) msg_err "Watchdog reiniciou mas o wg-quick falhou ao subir. Veja: journalctl -u $UNIT_NAME" ;;
+        *)     msg_err "Sem reinicio em 8 min. Verifique: journalctl -u $UNIT_NAME e systemctl list-timers" ;;
+    esac
+
+    printf 'Aguardando handshake apos remover o bloqueio'
+    _sip=$(server_tunnel_ip "$_tw")
+    _i=0
+    while [ "$_i" -lt 60 ]; do
+        [ -n "$_sip" ] && ping -c1 -W1 "$_sip" >/dev/null 2>&1
+        _hs=$(wg show "$_tw" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+        if [ "${_hs:-0}" -gt 0 ] && [ $(( $(date +%s) - _hs )) -lt 30 ]; then break; fi
+        printf '.'; sleep 2; _i=$((_i + 2))
+    done
+    printf '\n'
+    if [ "$_i" -lt 60 ]; then msg_ok "Tunel recuperado."; else msg_warn "Handshake ainda nao renovado; rode o diagnostico (menu 10)."; fi
+    mlog "$_tw" "teste watchdog finalizado: ${_res:-timeout}" >/dev/null
+}
+
 monitor_menu() {
     printf '\n--- Monitoramento automatico (DDNS + watchdog) ---\n'
     printf 'Eventos: %s/maintenance.log e %s\n' "$LOG_DIR" \
@@ -1758,6 +1930,8 @@ monitor_menu() {
     printf ' 4) Executar manutencao agora\n'
     printf ' 5) Instalar/atualizar agente (timer)\n'
     printf ' 6) Remover agente (timer)\n'
+    printf ' 7) Teste controlado do DDNS\n'
+    printf ' 8) Teste controlado do watchdog\n'
     printf ' 0) Voltar\n'
     ask _mo "Opcao"
     case "$_mo" in
@@ -1767,6 +1941,8 @@ monitor_menu() {
         4) need_wg && run_maintenance ;;
         5) install_agent ;;
         6) confirm "Remover agente e timer?" && remove_agent ;;
+        7) need_wg && test_ddns ;;
+        8) need_wg && test_watchdog ;;
         *) : ;;
     esac
 }
