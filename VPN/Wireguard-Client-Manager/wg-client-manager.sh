@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # wg-client-manager.sh
-# Versao    : 1.4.1 (2026-09-29)
+# Versao    : 1.5.0 (2026-09-29)
 # Projeto   : EdenCore - Comunidade de Infraestrutura de TI
 # Instrutor : Daniel Selbach Figueiró
 # Funcao    : criar e gerenciar clientes WireGuard (wg-quick) via menu interativo.
@@ -33,6 +33,15 @@
 #   1.4.1  Destino dos logs sempre informado na tela (antes e depois da
 #          captura); gravacao opcional do modo ao vivo em arquivo; listar e
 #          exibir relatorios salvos. Nenhum log sai da maquina.
+#   1.5.0  Operacao e automacao:
+#          - Agente de manutencao (timer systemd ou cron): re-resolucao de
+#            endpoint DDNS sem derrubar sessao e watchdog de handshake.
+#          - Backup datado antes de rotacao/PSK/MTU e rollback com 1 comando.
+#          - Teste de MTU ate o endpoint (DF bit) com sugestao e aplicacao.
+#          - Modo nao interativo idempotente (--create ...) p/ Ansible/scripts.
+#          - Retencao configuravel de relatorios de debug.
+#
+# Modo nao interativo: sh wg-client-manager.sh --help
 #
 # Seguranca por Design:
 #   - Executa somente como root; umask 077 em todo o fluxo (pastas 700, arquivos 600).
@@ -58,17 +67,26 @@
 # Uso: sudo sh wg-client-manager.sh
 # =============================================================================
 
-# shellcheck disable=SC2154,SC1091  # vars atribuidas via eval; os-release lido em runtime
+# shellcheck disable=SC2154,SC2153,SC1091  # vars atribuidas via eval; os-release lido em runtime
 set -u
 umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION="1.4.1"
+VERSION="1.5.0"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 LOG_DIR="${WG_LOG_DIR:-/var/log/wg-client-manager}"
 DYN_CTRL="/sys/kernel/debug/dynamic_debug/control"
 DEBUG_ACTIVE=0
+SETTINGS_FILE="/etc/wg-client-manager.conf"
+AGENT_BIN="/usr/local/sbin/wg-client-manager"
+UNIT_DIR="/etc/systemd/system"
+UNIT_NAME="wg-client-manager-maint"
+if [ -d /run ]; then RUN_DIR="/run/wg-client-manager"; else RUN_DIR="/var/run/wg-client-manager"; fi
+LOCK_DIR="$RUN_DIR/maint.lock"
+LOCK_HELD=0
+BACKUP_KEEP=5
+MTU=""
 
 # ----------------------------------------------------------------------------
 # Saida
@@ -94,8 +112,11 @@ debug_off() {
     fi
     DEBUG_ACTIVE=0
 }
-trap 'debug_off' EXIT
-trap 'restore_tty; debug_off; printf "\n"; exit 130' INT TERM
+release_lock() {
+    if [ "$LOCK_HELD" -eq 1 ]; then rm -rf "$LOCK_DIR"; LOCK_HELD=0; fi
+}
+trap 'debug_off; release_lock' EXIT
+trap 'restore_tty; debug_off; release_lock; printf "\n"; exit 130' INT TERM
 
 pause() {
     printf '\nPressione Enter para continuar...'
@@ -539,6 +560,8 @@ rotate_keys() {
     confirm "Rotacionar o par de chaves de '$_rt'?" || { msg_info "Cancelado."; return 0; }
 
     _old=$(tr -d ' \t\r\n' < "$_d/publickey")
+    _bk=$(backup_tunnel "$_rt" antes-rotacao) || { msg_err "Falha no backup. Rotacao abortada."; return 1; }
+    msg_info "Backup: $_bk (reverter: menu 16)"
     _was_up=0
     if tunnel_is_up "$_rt"; then _was_up=1; wg-quick down "$_rt"; fi
 
@@ -581,6 +604,8 @@ update_psk() {
         msg_err "PSK invalida (44 caracteres base64 terminando em '=')."
     done
 
+    _bk=$(backup_tunnel "$_up" antes-psk) || { msg_err "Falha no backup. Operacao abortada."; return 1; }
+    msg_info "Backup: $_bk (reverter: menu 16)"
     if [ -n "$_psk" ]; then
         rewrite_conf "$_d/$_up.conf" "" set "$_psk"
         printf '%s\n' "$_psk" > "$_d/presharedkey"
@@ -604,6 +629,29 @@ show_conf_masked() {
     sed -E 's/^(PrivateKey|PresharedKey)[[:space:]]*=.*/\1 = <oculta>/' "$WG_DIR/$_sc/$_sc.conf"
     printf '\n'
     msg_info "Saida segura para enviar a suporte/chamado."
+}
+
+# render_conf ARQ_PRIVKEY -> .conf a partir das variaveis globais do fluxo
+render_conf() {
+    printf '# Tunel WireGuard: %s\n' "$TUN"
+    printf '# Gerado por wg-client-manager.sh v%s em %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')"
+    if [ -n "$SRV_TIP" ]; then printf '# ServerTunnelIP = %s\n' "$SRV_TIP"; fi
+    printf '\n[Interface]\n'
+    printf 'PrivateKey = %s\n' "$(cat "$1")"
+    printf 'Address = %s\n' "$ADDR"
+    if [ -n "$MTU" ]; then printf 'MTU = %s\n' "$MTU"; fi
+    if [ -n "$DNS" ]; then printf 'DNS = %s\n' "$DNS"; fi
+    printf '\n[Peer]\n'
+    printf 'PublicKey = %s\n' "$SRV_PUB"
+    if [ -n "$PSK" ]; then printf 'PresharedKey = %s\n' "$PSK"; fi
+    printf 'Endpoint = %s:%s\n' "$SRV_FMT" "$SRV_PORT"
+    printf 'AllowedIPs = %s\n' "$ALLOWED"
+    if [ "$KA" -gt 0 ]; then printf 'PersistentKeepalive = %s\n' "$KA"; fi
+}
+
+valid_mtu() {
+    case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
+    [ "$1" -ge 1280 ] && [ "$1" -le 9000 ]
 }
 
 # ----------------------------------------------------------------------------
@@ -743,6 +791,16 @@ create_client() {
         msg_err "Valor invalido (0-65535)."
     done
 
+    # 10. MTU (opcional)
+    MTU=""
+    while :; do
+        ask MTU "MTU do tunel (Enter = automatico do wg-quick | teste pelo menu 14 > 3)"
+        [ -z "$MTU" ] && break
+        valid_mtu "$MTU" && break
+        msg_err "MTU invalido (1280-9000)."
+        MTU=""
+    done
+
     # Resumo
     printf '\n--- Resumo ---\n'
     printf 'Tunel ............: %s\n' "$TUN"
@@ -754,6 +812,7 @@ create_client() {
     if [ -n "$PSK" ]; then printf 'PresharedKey .....: [definida]\n'; else printf 'PresharedKey .....: nao\n'; fi
     printf 'DNS ..............: %s\n' "${DNS:-nao}"
     printf 'Keepalive ........: %s\n' "$KA"
+    printf 'MTU ..............: %s\n' "${MTU:-automatico}"
     printf 'Pasta ............: %s/%s\n\n' "$WG_DIR" "$TUN"
 
     if ! confirm "Gravar configuracao?"; then
@@ -776,22 +835,7 @@ create_client() {
         printf '%s\n' "$PSK" > "$_dir/presharedkey"
     fi
 
-    {
-        printf '# Tunel WireGuard: %s\n' "$TUN"
-        printf '# Gerado por wg-client-manager.sh v%s em %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')"
-        if [ -n "$SRV_TIP" ]; then printf '# ServerTunnelIP = %s\n' "$SRV_TIP"; fi
-        printf '\n'
-        printf '[Interface]\n'
-        printf 'PrivateKey = %s\n' "$(cat "$_dir/privatekey")"
-        printf 'Address = %s\n' "$ADDR"
-        if [ -n "$DNS" ]; then printf 'DNS = %s\n' "$DNS"; fi
-        printf '\n[Peer]\n'
-        printf 'PublicKey = %s\n' "$SRV_PUB"
-        if [ -n "$PSK" ]; then printf 'PresharedKey = %s\n' "$PSK"; fi
-        printf 'Endpoint = %s:%s\n' "$SRV_FMT" "$SRV_PORT"
-        printf 'AllowedIPs = %s\n' "$ALLOWED"
-        if [ "$KA" -gt 0 ]; then printf 'PersistentKeepalive = %s\n' "$KA"; fi
-    } > "$_conf"
+    render_conf "$_dir/privatekey" > "$_conf"
 
     chmod 600 "$_dir"/*
     ln -s "$TUN/$TUN.conf" "$WG_DIR/$TUN.conf"
@@ -844,6 +888,7 @@ tunnel_up() {
         msg_info "Tunel $1 ja esta ativo."
         return 0
     fi
+    rm -f "$WG_DIR/$1/.admin-down"
     if wg-quick up "$1"; then
         msg_ok "Interface $1 ativa."
         diagnose_tunnel "$1"
@@ -855,10 +900,13 @@ tunnel_up() {
 
 tunnel_down() {
     if ! tunnel_is_up "$1"; then
+        : > "$WG_DIR/$1/.admin-down"
         msg_info "Tunel $1 ja esta inativo."
         return 0
     fi
-    wg-quick down "$1" && msg_ok "Tunel $1 desativado."
+    # Marca desligamento administrativo: o watchdog nao religa o tunel.
+    : > "$WG_DIR/$1/.admin-down"
+    wg-quick down "$1" && msg_ok "Tunel $1 desativado (watchdog nao religa ate ativar de novo)."
 }
 
 tunnel_boot() {
@@ -1072,6 +1120,7 @@ debug_capture() {
     confirm "Reiniciar o tunel no inicio (registra o handshake desde o zero)?" && _restart=1
 
     mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+    apply_retention >/dev/null
     _stamp=$(date '+%Y%m%d-%H%M%S')
     _log="$LOG_DIR/${_dt}-${_stamp}.log"
     _klog="$LOG_DIR/.${_dt}-${_stamp}.klog"
@@ -1256,20 +1305,748 @@ debug_menu() {
     printf -- '-----------------------------------------------------\n'
     printf ' 1) Captura guiada com relatorio (recomendado)\n'
     printf ' 2) Acompanhar log do kernel ao vivo\n'
-    printf ' 3) Listar relatorios salvos\n'
-    printf ' 4) Exibir ultimo relatorio\n'
-    printf ' 5) Status do debug\n'
-    printf ' 6) Forcar desativacao do debug\n'
+    printf ' 3) Teste de MTU ate o endpoint\n'
+    printf ' 4) Listar relatorios salvos\n'
+    printf ' 5) Exibir ultimo relatorio\n'
+    printf ' 6) Retencao de relatorios (atual: %s dias)\n' "$(setting_get RETENTION_DAYS 30)"
+    printf ' 7) Status do debug\n'
+    printf ' 8) Forcar desativacao do debug\n'
     printf ' 0) Voltar\n'
     ask _dopt "Opcao"
     case "$_dopt" in
         1) need_wg && debug_capture ;;
         2) debug_live ;;
-        3) list_reports ;;
-        4) show_last_report ;;
-        5) debug_status ;;
-        6) debug_force_off ;;
+        3) need_wg && mtu_test ;;
+        4) list_reports ;;
+        5) show_last_report ;;
+        6) retention_menu ;;
+        7) debug_status ;;
+        8) debug_force_off ;;
         *) : ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# Utilitarios gerais
+# ----------------------------------------------------------------------------
+conf_get() {
+    sed -n "s/^$1[[:space:]]*=[[:space:]]*//p" "$2" 2>/dev/null | head -n1
+}
+
+# Configuracao global (KEY=VALOR). Lida sem "source": evita execucao de codigo.
+setting_get() {
+    _sv=$(sed -n "s/^$1=//p" "$SETTINGS_FILE" 2>/dev/null | head -n1)
+    case "$_sv" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$_sv" ;; esac
+}
+
+setting_set() {
+    _stmp="$SETTINGS_FILE.tmp"
+    { grep -v "^$1=" "$SETTINGS_FILE" 2>/dev/null; printf '%s=%s\n' "$1" "$2"; } > "$_stmp"
+    mv "$_stmp" "$SETTINGS_FILE" && chmod 600 "$SETTINGS_FILE"
+}
+
+state_get() {
+    _sg=$(cat "$RUN_DIR/$1.$2" 2>/dev/null)
+    case "$_sg" in ''|*[!0-9]*) printf '%s' "$3" ;; *) printf '%s' "$_sg" ;; esac
+}
+
+state_set() {
+    mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+    printf '%s\n' "$3" > "$RUN_DIR/$1.$2"
+}
+
+monitor_get() {
+    _mg=$(sed -n "s/^$2=//p" "$WG_DIR/$1/monitor.conf" 2>/dev/null | head -n1)
+    case "$_mg" in ''|*[!0-9]*) printf '%s' "$3" ;; *) printf '%s' "$_mg" ;; esac
+}
+
+# Log de eventos do agente: arquivo local + journal (systemd) ou syslog (cron)
+mlog() {
+    mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+    _ml="$LOG_DIR/maintenance.log"
+    if [ -f "$_ml" ] && [ "$(wc -c < "$_ml")" -gt 1048576 ]; then mv "$_ml" "$_ml.1"; fi
+    _mm="$(date '+%Y-%m-%d %H:%M:%S') [$1] $2"
+    printf '%s\n' "$_mm" >> "$_ml"; chmod 600 "$_ml"
+    printf '%s\n' "$_mm"
+    if [ -z "${INVOCATION_ID:-}" ] && command -v logger >/dev/null 2>&1; then
+        logger -t wg-client-manager -- "[$1] $2" 2>/dev/null
+    fi
+}
+
+acquire_lock() {
+    mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"; LOCK_HELD=1; return 0
+    fi
+    _lp=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null; then return 1; fi
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"; LOCK_HELD=1
+}
+
+resolve_host() {
+    _rh=""
+    if command -v getent >/dev/null 2>&1; then
+        _rh=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}')
+        [ -z "$_rh" ] && _rh=$(getent hosts "$1" 2>/dev/null | awk 'NR==1{print $1}')
+    fi
+    if [ -z "$_rh" ] && command -v nslookup >/dev/null 2>&1; then
+        _rh=$(nslookup "$1" 2>/dev/null | awk '/^Name:/{f=1;next} f&&/^Address/{if($1=="Address:")print $2; else print $3; exit}')
+    fi
+    [ -n "$_rh" ] || return 1
+    printf '%s' "$_rh"
+}
+
+# Endpoint do .conf -> _ep_host / _ep_port
+parse_endpoint() {
+    _ep=$(conf_get Endpoint "$WG_DIR/$1/$1.conf")
+    _ep_port=${_ep##*:}
+    _ep_host=${_ep%:*}; _ep_host=${_ep_host#[}; _ep_host=${_ep_host%]}
+}
+
+# ----------------------------------------------------------------------------
+# Backup e rollback
+# ----------------------------------------------------------------------------
+backup_tunnel() {
+    _bt="$WG_DIR/$1/.backup"
+    _bd="$_bt/$(date '+%Y%m%d-%H%M%S')-$2"
+    mkdir -p "$_bd" && chmod 700 "$_bt" "$_bd" || return 1
+    for _bf in privatekey publickey presharedkey "$1.conf"; do
+        [ -f "$WG_DIR/$1/$_bf" ] && cp -p "$WG_DIR/$1/$_bf" "$_bd/"
+    done
+    chmod 600 "$_bd"/* 2>/dev/null
+    # shellcheck disable=SC2012
+    ls -1dt "$_bt"/*/ 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))" | while IFS= read -r _old_bk; do
+        rm -rf "$_old_bk"
+    done
+    printf '%s' "$_bd"
+}
+
+rollback_tunnel() {
+    select_tunnel _rb || return 1
+    _bt="$WG_DIR/$_rb/.backup"
+    # shellcheck disable=SC2012
+    _list=$(ls -1dt "$_bt"/*/ 2>/dev/null)
+    if [ -z "$_list" ]; then
+        msg_info "Nenhum backup para '$_rb'. Backups sao criados antes de rotacao, PSK, MTU e atualizacao via CLI."
+        return 0
+    fi
+    printf '\n--- Backups de %s (mais recente primeiro, mantidos: %s) ---\n' "$_rb" "$BACKUP_KEEP"
+    printf '%s\n' "$_list" | awk '{n=split($0,a,"/"); printf "  %d) %s\n", NR, a[n-1]}'
+    _cnt=$(printf '%s\n' "$_list" | wc -l)
+    while :; do
+        ask _sel_bk "Restaurar qual" "1"
+        case "$_sel_bk" in ''|*[!0-9]*) ;; *) [ "$_sel_bk" -ge 1 ] && [ "$_sel_bk" -le "$_cnt" ] && break ;; esac
+        msg_err "Escolha entre 1 e $_cnt."
+    done
+    _src=$(printf '%s\n' "$_list" | sed -n "${_sel_bk}p"); _src=${_src%/}
+    confirm "Restaurar '$(basename "$_src")' em '$_rb'?" || { msg_info "Cancelado."; return 0; }
+
+    _d="$WG_DIR/$_rb"
+    _cur=$(tr -d ' \t\r\n' < "$_d/publickey")
+    _pre=$(backup_tunnel "$_rb" antes-rollback)
+    for _bf in privatekey publickey "$_rb.conf"; do
+        cp -p "$_src/$_bf" "$_d/$_bf" || { msg_err "Falha ao restaurar $_bf."; return 1; }
+    done
+    if [ -f "$_src/presharedkey" ]; then cp -p "$_src/presharedkey" "$_d/presharedkey"; else rm -f "$_d/presharedkey"; fi
+    chmod 600 "$_d/privatekey" "$_d/publickey" "$_d/$_rb.conf"
+    _res=$(tr -d ' \t\r\n' < "$_d/publickey")
+    msg_ok "Restaurado. Estado anterior salvo em $_pre (rollback tambem e reversivel)."
+
+    if [ "$_cur" != "$_res" ]; then
+        printf '\nA chave publica mudou. No SERVIDOR:\n'
+        printf '/interface wireguard peers set [find public-key="%s"] public-key="%s"\n' "$_cur" "$_res"
+        printf '/interface wireguard peers print detail where public-key="%s"\n\n' "$_res"
+    fi
+    if tunnel_is_up "$_rb"; then
+        wg-quick down "$_rb" >/dev/null 2>&1
+        tunnel_up "$_rb"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Agente de manutencao: DDNS + watchdog + retencao
+# ----------------------------------------------------------------------------
+# Re-resolve o endpoint e atualiza com "wg set" (sem derrubar a sessao).
+# Retorna 0 somente se o endpoint foi alterado.
+reresolve_endpoint() {
+    parse_endpoint "$1"
+    valid_ip "$_ep_host" && return 1
+    if ! _rr_new=$(resolve_host "$_ep_host"); then
+        mlog "$1" "DDNS: falha ao resolver $_ep_host"
+        return 1
+    fi
+    _rr_cur=$(wg show "$1" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+    _rr_cur=${_rr_cur%:*}; _rr_cur=${_rr_cur#[}; _rr_cur=${_rr_cur%]}
+    [ "$_rr_new" = "$_rr_cur" ] && return 1
+    _rr_peer=$(wg show "$1" peers 2>/dev/null | head -n1)
+    [ -n "$_rr_peer" ] || return 1
+    case "$_rr_new" in *:*) _rr_fmt="[$_rr_new]" ;; *) _rr_fmt=$_rr_new ;; esac
+    if wg set "$1" peer "$_rr_peer" endpoint "$_rr_fmt:$_ep_port"; then
+        mlog "$1" "DDNS: $_ep_host mudou de ${_rr_cur:-nenhum} para $_rr_new; endpoint atualizado sem reiniciar"
+        return 0
+    fi
+    mlog "$1" "DDNS: falha ao aplicar novo endpoint $_rr_new"
+    return 1
+}
+
+maint_tunnel() {
+    _mt=$1
+    [ "$(monitor_get "$_mt" ENABLED 0)" = "1" ] || return 0
+    [ -f "$WG_DIR/$_mt/.admin-down" ] && return 0
+    _mnow=$(date +%s)
+    _mhsmax=$(monitor_get "$_mt" HS_MAX 180)
+    _mback=$(monitor_get "$_mt" BACKOFF 300)
+    _mlr=$(state_get "$_mt" last_restart 0)
+
+    if ! tunnel_is_up "$_mt"; then
+        if [ $((_mnow - _mlr)) -ge "$_mback" ]; then
+            mlog "$_mt" "tunel inativo sem desligamento administrativo: subindo"
+            if wg-quick up "$_mt" >/dev/null 2>&1; then
+                mlog "$_mt" "tunel ativo"
+                state_set "$_mt" last_up "$_mnow"
+            else
+                mlog "$_mt" "falha ao subir o tunel (nova tentativa em ${_mback}s)"
+            fi
+            state_set "$_mt" last_restart "$_mnow"
+        fi
+        return 0
+    fi
+
+    _mhs=$(wg show "$_mt" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+    _mhs=${_mhs:-0}
+    if [ "$_mhs" -gt 0 ]; then
+        _mage=$((_mnow - _mhs))
+    else
+        _mlu=$(state_get "$_mt" last_up 0)
+        if [ "$_mlu" -eq 0 ]; then state_set "$_mt" last_up "$_mnow"; return 0; fi
+        _mage=$((_mnow - _mlu))
+    fi
+
+    # Saudavel: handshake renovado recentemente (rekey a cada ~2 min com trafego/keepalive)
+    [ "$_mage" -le 135 ] && return 0
+
+    # 1o DDNS: IP publico do servidor mudou? Corrige sem reiniciar.
+    if [ "$(monitor_get "$_mt" DDNS 1)" = "1" ] && reresolve_endpoint "$_mt"; then
+        return 0
+    fi
+
+    # 2o watchdog: handshake velho e fora do backoff -> reinicia
+    if [ "$(monitor_get "$_mt" WATCHDOG 1)" = "1" ] && [ "$_mage" -gt "$_mhsmax" ] &&
+       [ $((_mnow - _mlr)) -ge "$_mback" ]; then
+        mlog "$_mt" "watchdog: sem handshake ha ${_mage}s (limite ${_mhsmax}s): reiniciando tunel"
+        wg-quick down "$_mt" >/dev/null 2>&1
+        if wg-quick up "$_mt" >/dev/null 2>&1; then
+            mlog "$_mt" "watchdog: tunel reiniciado"
+        else
+            mlog "$_mt" "watchdog: falha ao subir apos reinicio"
+        fi
+        state_set "$_mt" last_restart "$_mnow"
+        state_set "$_mt" last_up "$_mnow"
+    fi
+}
+
+apply_retention() {
+    _rdays=$(setting_get RETENTION_DAYS 30)
+    [ -d "$LOG_DIR" ] || { printf '0'; return 0; }
+    find "$LOG_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.log.1' \) ! -name 'maintenance.log' \
+        -mtime +"$_rdays" -print -exec rm -f {} \; 2>/dev/null | wc -l | tr -d ' '
+}
+
+retention_daily() {
+    _today=$(date +%Y%m%d)
+    [ "$(state_get global retention_day 0)" = "$_today" ] && return 0
+    _rem=$(apply_retention)
+    state_set global retention_day "$_today"
+    [ "${_rem:-0}" -gt 0 ] && mlog global "retencao: $_rem relatorio(s) com mais de $(setting_get RETENTION_DAYS 30) dias removido(s)"
+    return 0
+}
+
+run_maintenance() {
+    if ! acquire_lock; then
+        printf 'Manutencao ja em execucao; ignorando.\n'
+        return 0
+    fi
+    _mn=0
+    for _mdir in "$WG_DIR"/*/; do
+        [ -d "$_mdir" ] || continue
+        _mname=$(basename "$_mdir")
+        tunnel_exists "$_mname" || continue
+        [ -f "$_mdir/monitor.conf" ] || continue
+        _mn=$((_mn + 1))
+        maint_tunnel "$_mname"
+    done
+    retention_daily
+    release_lock
+    [ -t 1 ] && msg_ok "Manutencao concluida: $_mn tunel(is) monitorado(s) verificado(s)."
+    return 0
+}
+
+agent_installed() {
+    [ -x "$AGENT_BIN" ] || return 1
+    if [ "$(init_system)" = "systemd" ]; then
+        systemctl is-enabled --quiet "$UNIT_NAME.timer" 2>/dev/null
+    else
+        grep -qs "$AGENT_BIN --maintenance" /etc/cron.d/wg-client-manager /etc/crontabs/root
+    fi
+}
+
+install_agent() {
+    _self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    if [ ! -f "$_self" ]; then
+        msg_err "Nao foi possivel localizar o proprio script ($0)."
+        return 1
+    fi
+    if [ "$_self" != "$AGENT_BIN" ]; then
+        mkdir -p "$(dirname "$AGENT_BIN")"
+        cp "$_self" "$AGENT_BIN.tmp" && chown root:root "$AGENT_BIN.tmp" 2>/dev/null
+        if ! { chmod 700 "$AGENT_BIN.tmp" && mv "$AGENT_BIN.tmp" "$AGENT_BIN"; }; then
+            msg_err "Falha ao instalar $AGENT_BIN"; return 1
+        fi
+    fi
+    msg_ok "Agente v$VERSION em $AGENT_BIN (root, 700)."
+
+    if [ "$(init_system)" = "systemd" ]; then
+        cat > "$UNIT_DIR/$UNIT_NAME.service" <<EOF
+# wg-client-manager v$VERSION - EdenCore
+[Unit]
+Description=wg-client-manager: manutencao WireGuard (DDNS, watchdog, retencao)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$AGENT_BIN --maintenance
+# Seguranca por Design: precisa de root/CAP_NET_ADMIN para "wg set" e "wg-quick";
+# demais superficies restritas.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=true
+Nice=10
+EOF
+        cat > "$UNIT_DIR/$UNIT_NAME.timer" <<EOF
+# wg-client-manager v$VERSION - EdenCore
+[Unit]
+Description=wg-client-manager: manutencao a cada 1 minuto
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+        chmod 644 "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
+        if systemctl daemon-reload && systemctl enable --now "$UNIT_NAME.timer" >/dev/null 2>&1; then
+            msg_ok "Timer systemd $UNIT_NAME.timer ativo (a cada 1 min)."
+        else
+            msg_err "Falha ao ativar o timer."; return 1
+        fi
+    else
+        _cronline="* * * * * $AGENT_BIN --maintenance >/dev/null 2>&1"
+        if [ -d /etc/cron.d ]; then
+            printf '# wg-client-manager v%s - EdenCore\n* * * * * root %s --maintenance >/dev/null 2>&1\n' "$VERSION" "$AGENT_BIN" > /etc/cron.d/wg-client-manager
+            chmod 644 /etc/cron.d/wg-client-manager
+            msg_ok "Cron instalado em /etc/cron.d/wg-client-manager (a cada 1 min)."
+        elif [ -f /etc/crontabs/root ] || [ -d /etc/crontabs ]; then
+            grep -qs "$AGENT_BIN --maintenance" /etc/crontabs/root || printf '%s\n' "$_cronline" >> /etc/crontabs/root
+            msg_ok "Cron instalado em /etc/crontabs/root (a cada 1 min)."
+        else
+            msg_err "Nem systemd nem cron encontrados. Agende manualmente: $_cronline"
+            return 1
+        fi
+        msg_info "Confirme que o servico cron (crond/cronie) esta ativo e habilitado no boot."
+    fi
+}
+
+remove_agent() {
+    if [ "$(init_system)" = "systemd" ]; then
+        systemctl disable --now "$UNIT_NAME.timer" >/dev/null 2>&1
+        rm -f "$UNIT_DIR/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.service"
+        systemctl daemon-reload 2>/dev/null
+    fi
+    rm -f /etc/cron.d/wg-client-manager
+    if [ -f /etc/crontabs/root ]; then
+        grep -v "$AGENT_BIN --maintenance" /etc/crontabs/root > /etc/crontabs/root.tmp && mv /etc/crontabs/root.tmp /etc/crontabs/root
+    fi
+    rm -f "$AGENT_BIN"
+    msg_ok "Agente removido. Tuneis e configuracoes de monitoramento foram mantidos."
+}
+
+monitor_enable() {
+    select_tunnel _me || return 1
+    _ka=$(conf_get PersistentKeepalive "$WG_DIR/$_me/$_me.conf")
+    _wd=1
+    if [ -z "$_ka" ] || [ "$_ka" = "0" ]; then
+        msg_warn "PersistentKeepalive desativado: sem trafego o handshake envelhece e o watchdog reiniciaria o tunel sem motivo."
+        msg_warn "Watchdog sera DESATIVADO neste tunel; DDNS continua ativo."
+        _wd=0
+    fi
+    while :; do
+        ask _hsm "Reiniciar se sem handshake por mais de N segundos (150-3600)" "180"
+        case "$_hsm" in ''|*[!0-9]*) ;; *) [ "$_hsm" -ge 150 ] && [ "$_hsm" -le 3600 ] && break ;; esac
+        msg_err "Valor entre 150 e 3600 (rekey do WireGuard ocorre a cada ~120s)."
+    done
+    parse_endpoint "$_me"
+    _dd=1; valid_ip "$_ep_host" && _dd=0
+    printf 'ENABLED=1\nHS_MAX=%s\nDDNS=%s\nWATCHDOG=%s\nBACKOFF=300\n' "$_hsm" "$_dd" "$_wd" > "$WG_DIR/$_me/monitor.conf"
+    chmod 600 "$WG_DIR/$_me/monitor.conf"
+    msg_ok "Monitoramento ativo em '$_me' (DDNS=$_dd, WATCHDOG=$_wd, limite=${_hsm}s)."
+    [ "$_dd" -eq 0 ] && msg_info "Endpoint e IP fixo ($_ep_host): re-resolucao DDNS nao se aplica."
+    if agent_installed; then
+        msg_info "Agente ja instalado. Se atualizou o script, reinstale pela opcao 5 para alinhar a versao."
+    else
+        install_agent
+    fi
+}
+
+monitor_disable() {
+    select_tunnel _md || return 1
+    rm -f "$WG_DIR/$_md/monitor.conf"
+    msg_ok "Monitoramento desativado em '$_md'."
+}
+
+monitor_status() {
+    printf '\n--- Monitoramento automatico ---\n'
+    if agent_installed; then
+        msg_ok "Agente instalado: $("$AGENT_BIN" --version 2>/dev/null) | script atual: v$VERSION"
+        if [ "$(init_system)" = "systemd" ]; then
+            msg_info "Timer: $(systemctl is-active "$UNIT_NAME.timer" 2>/dev/null) | proxima: $(systemctl show -p NextElapseUSecRealtime --value "$UNIT_NAME.timer" 2>/dev/null)"
+        fi
+    else
+        msg_warn "Agente NAO instalado: DDNS e watchdog nao estao rodando."
+    fi
+    printf '\n%-16s %-6s %-5s %-5s %-9s %s\n' "TUNEL" "ESTADO" "DDNS" "WDOG" "HANDSHAKE" "ENDPOINT ATUAL"
+    for _sd in "$WG_DIR"/*/; do
+        [ -d "$_sd" ] || continue
+        _sn=$(basename "$_sd")
+        tunnel_exists "$_sn" || continue
+        [ -f "$_sd/monitor.conf" ] || continue
+        if tunnel_is_up "$_sn"; then
+            _st="UP"
+            _sh=$(wg show "$_sn" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+            if [ "${_sh:-0}" -gt 0 ]; then _sa="$(( $(date +%s) - _sh ))s"; else _sa="nunca"; fi
+            _se=$(wg show "$_sn" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+        else
+            _st="DOWN"; _sa="-"; _se="-"
+        fi
+        [ -f "$_sd/.admin-down" ] && _st="ADM-OFF"
+        printf '%-16s %-6s %-5s %-5s %-9s %s\n' "$_sn" "$_st" "$(monitor_get "$_sn" DDNS 0)" "$(monitor_get "$_sn" WATCHDOG 0)" "$_sa" "$_se"
+    done
+    printf '\nUltimos eventos (%s/maintenance.log):\n' "$LOG_DIR"
+    tail -n 10 "$LOG_DIR/maintenance.log" 2>/dev/null || printf '  (sem eventos)\n'
+}
+
+monitor_menu() {
+    printf '\n--- Monitoramento automatico (DDNS + watchdog) ---\n'
+    printf 'Eventos: %s/maintenance.log e %s\n' "$LOG_DIR" \
+        "$([ "$(init_system)" = systemd ] && echo "journalctl -u $UNIT_NAME" || echo "syslog (logger)")"
+    printf -- '-----------------------------------------------------\n'
+    printf ' 1) Ativar monitoramento em um tunel\n'
+    printf ' 2) Desativar monitoramento em um tunel\n'
+    printf ' 3) Status e ultimos eventos\n'
+    printf ' 4) Executar manutencao agora\n'
+    printf ' 5) Instalar/atualizar agente (timer)\n'
+    printf ' 6) Remover agente (timer)\n'
+    printf ' 0) Voltar\n'
+    ask _mo "Opcao"
+    case "$_mo" in
+        1) need_wg && monitor_enable ;;
+        2) monitor_disable ;;
+        3) monitor_status ;;
+        4) need_wg && run_maintenance ;;
+        5) install_agent ;;
+        6) confirm "Remover agente e timer?" && remove_agent ;;
+        *) : ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# Teste de MTU (Path MTU com bit DF ate o endpoint)
+# ----------------------------------------------------------------------------
+ping_df_supported() {
+    ping -c1 -W1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1
+}
+
+# ping_df ALVO PAYLOAD FAMILIA(4|6)
+ping_df() {
+    if [ "$3" = "6" ]; then
+        ping -6 -c2 -i 0.2 -W1 -M "do" -s "$2" "$1" >/dev/null 2>&1
+    else
+        ping -c2 -i 0.2 -W1 -M "do" -s "$2" "$1" >/dev/null 2>&1
+    fi
+}
+
+# conf_set_iface ARQ CHAVE VALOR -> define/remove chave no [Interface] (valores nao secretos)
+conf_set_iface() {
+    _cf=$1; _ct="$1.tmp"
+    while IFS= read -r _l || [ -n "$_l" ]; do
+        case "$_l" in
+            "$2"*=*) ;;
+            Address*=*)
+                printf '%s\n' "$_l"
+                [ -n "$3" ] && printf '%s = %s\n' "$2" "$3" ;;
+            *) printf '%s\n' "$_l" ;;
+        esac
+    done < "$_cf" > "$_ct" && mv "$_ct" "$_cf" && chmod 600 "$_cf"
+}
+
+mtu_test() {
+    select_tunnel _mu || return 1
+    if ! ping_df_supported; then
+        msg_err "ping sem suporte a '-M do' (busybox). Instale iputils (ex.: apk add iputils)."
+        return 1
+    fi
+    parse_endpoint "$_mu"
+    _mtarget=""
+    if tunnel_is_up "$_mu"; then
+        _mtarget=$(wg show "$_mu" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+        _mtarget=${_mtarget%:*}; _mtarget=${_mtarget#[}; _mtarget=${_mtarget%]}
+        [ "$_mtarget" = "(none)" ] && _mtarget=""
+    fi
+    if [ -z "$_mtarget" ]; then
+        if valid_ip "$_ep_host"; then _mtarget=$_ep_host; else _mtarget=$(resolve_host "$_ep_host"); fi
+    fi
+    [ -n "$_mtarget" ] || { msg_err "Nao foi possivel determinar o IP do endpoint."; return 1; }
+    case "$_mtarget" in *:*) _mf=6; _mhdr=48; _movh=80 ;; *) _mf=4; _mhdr=28; _movh=60 ;; esac
+
+    _approx=0
+    if ! ping_df "$_mtarget" 16 "$_mf"; then
+        msg_warn "Endpoint $_mtarget nao responde ICMP (comum: firewall de borda bloqueia ping na WAN)."
+        if [ "$_mf" = "4" ] && confirm "Medir contra 1.1.1.1 como aproximacao do MTU do seu link?"; then
+            _mtarget=1.1.1.1; _approx=1
+            ping_df "$_mtarget" 16 4 || { msg_err "1.1.1.1 tambem nao responde. Teste impossivel agora."; return 1; }
+        else
+            return 1
+        fi
+    fi
+
+    msg_info "Medindo Path MTU ate $_mtarget (DF ligado)..."
+    _lo=$((1280 - _mhdr)); _hi=$((1500 - _mhdr))
+    if ! ping_df "$_mtarget" "$_lo" "$_mf"; then
+        msg_err "Nem $((_lo + _mhdr)) bytes passam sem fragmentar. Caminho muito restrito; verifique o link."
+        return 1
+    fi
+    if ping_df "$_mtarget" "$_hi" "$_mf"; then
+        _lo=$_hi
+    else
+        while [ "$_lo" -lt "$_hi" ]; do
+            _mid=$(( (_lo + _hi + 1) / 2 ))
+            if ping_df "$_mtarget" "$_mid" "$_mf"; then _lo=$_mid; else _hi=$((_mid - 1)); fi
+        done
+    fi
+    _pmtu=$((_lo + _mhdr))
+    _sug=$((_pmtu - _movh))
+    if tunnel_is_up "$_mu"; then _curm=$(cat "/sys/class/net/$_mu/mtu" 2>/dev/null); else _curm=$(conf_get MTU "$WG_DIR/$_mu/$_mu.conf"); fi
+    _curm=${_curm:-1420}
+
+    printf '\nPath MTU ate %s%s : %s bytes\n' "$_mtarget" "$([ "$_approx" -eq 1 ] && echo ' (aproximacao)')" "$_pmtu"
+    printf 'Overhead WireGuard (endpoint IPv%s) : %s bytes\n' "$_mf" "$_movh"
+    printf 'MTU recomendado do tunel          : %s\n' "$_sug"
+    printf 'MTU atual do tunel                : %s\n\n' "$_curm"
+
+    if [ "$_sug" -lt 1280 ]; then
+        msg_warn "Recomendado abaixo de 1280: IPv6 dentro do tunel nao funcionara. Use 1280 e revise o link."
+        _sug=1280
+    fi
+    if [ "$_curm" -le "$_sug" ]; then
+        msg_ok "MTU atual adequado ao caminho."
+        return 0
+    fi
+    msg_warn "MTU atual ($_curm) acima do caminho: pacotes grandes fragmentam ou somem (ping OK, SSH/HTTPS trava)."
+    if confirm "Gravar MTU = $_sug no .conf (com backup) e reiniciar o tunel?"; then
+        _bk=$(backup_tunnel "$_mu" antes-mtu) && msg_info "Backup: $_bk"
+        conf_set_iface "$WG_DIR/$_mu/$_mu.conf" MTU "$_sug"
+        msg_ok "MTU = $_sug gravado."
+        if tunnel_is_up "$_mu"; then wg-quick down "$_mu" >/dev/null 2>&1; tunnel_up "$_mu"; fi
+    fi
+}
+
+retention_menu() {
+    _cur=$(setting_get RETENTION_DAYS 30)
+    msg_info "Retencao atual: relatorios com mais de $_cur dias sao removidos (maintenance.log rotaciona em 1 MB)."
+    while :; do
+        ask _nd "Nova retencao em dias (1-3650)" "$_cur"
+        case "$_nd" in ''|*[!0-9]*|0*) ;; *) [ "$_nd" -le 3650 ] && break ;; esac
+        msg_err "Informe de 1 a 3650."
+    done
+    setting_set RETENTION_DAYS "$_nd"
+    _rem=$(apply_retention)
+    msg_ok "Retencao: $_nd dias. Removidos agora: ${_rem:-0}. Configuracao em $SETTINGS_FILE."
+    agent_installed || msg_info "Sem agente instalado, a retencao roda a cada captura guiada ou por esta opcao."
+}
+
+# ----------------------------------------------------------------------------
+# Modo nao interativo (idempotente)
+# ----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+wg-client-manager.sh v$VERSION - EdenCore (Instrutor: Daniel Selbach Figueiró)
+
+Uso interativo : sudo sh wg-client-manager.sh
+Uso automatizado:
+  --create                       Cria ou converge um tunel (idempotente)
+    --name NOME                  a-z 0-9 - _, inicia com letra, max 15 (obrigatorio)
+    --endpoint HOST:PORTA        IPv4, [IPv6] ou FQDN; porta padrao 51820 (obrigatorio)
+    --server-pubkey CHAVE        chave publica do servidor (obrigatorio)
+    --address CIDR[,CIDR]        IP do cliente no tunel (obrigatorio)
+    --allowed-ips CIDR[,CIDR]    redes roteadas pela VPN (obrigatorio)
+    --server-tunnel-ip IP        IP do servidor no tunel (vira /32 no AllowedIPs)
+    --psk-file ARQ | --psk-stdin PSK gerada no servidor (nunca como argumento)
+    --dns IP[,IP]  --keepalive N (padrao 25)  --mtu N
+    --up  --boot  --monitor      sobe, habilita no boot, ativa DDNS+watchdog
+    --strict                     falha se houver sobreposicao de rotas
+  --show-pubkey NOME             imprime a chave publica do cliente
+  --list                         lista tuneis
+  --diagnose NOME                diagnostico de handshake
+  --maintenance                  ciclo do agente (DDNS, watchdog, retencao)
+  --install                      instala WireGuard e dependencias
+  --version | --help
+
+Saida de --create: linhas STATUS=changed|unchanged e PUBKEY=<chave publica>.
+Codigos: 0 ok | 1 entrada invalida | 2 erro de execucao.
+Ansible: changed_when: "'STATUS=changed' in resultado.stdout"
+EOF
+}
+
+cli_die() { msg_err "$1"; exit "${2:-1}"; }
+
+cli_create() {
+    [ -n "$TUN" ] || cli_die "--name obrigatorio."
+    valid_tunnel_name "$TUN" || cli_die "--name invalido: '$TUN'."
+    [ -n "$EP_ARG" ] || cli_die "--endpoint obrigatorio."
+    case "$EP_ARG" in
+        \[*\]:*) _h=${EP_ARG%:*}; _h=${_h#[}; _h=${_h%]}; SRV_PORT=${EP_ARG##*:} ;;
+        \[*\])   _h=${EP_ARG#[}; _h=${_h%]}; SRV_PORT=51820 ;;
+        *:*:*)   cli_die "IPv6 no endpoint deve estar entre colchetes: [2001:db8::1]:51820" ;;
+        *:*)     _h=${EP_ARG%:*}; SRV_PORT=${EP_ARG##*:} ;;
+        *)       _h=$EP_ARG; SRV_PORT=51820 ;;
+    esac
+    if valid_ipv4 "$_h" || valid_fqdn "$_h"; then SRV_FMT=$_h
+    elif valid_ipv6 "$_h"; then SRV_FMT="[$_h]"
+    else cli_die "--endpoint com host invalido: '$_h'."; fi
+    valid_port "$SRV_PORT" || cli_die "Porta invalida: '$SRV_PORT'."
+    valid_wgkey "$SRV_PUB" || cli_die "--server-pubkey invalida."
+    ADDR=$(normalize_list "$ADDR_IN" valid_cidr) || cli_die "--address invalido."
+    ALLOWED=$(normalize_list "$ALLOWED_IN" valid_cidr) || cli_die "--allowed-ips invalido."
+    if [ -n "$SRV_TIP" ]; then
+        valid_ip "$SRV_TIP" || cli_die "--server-tunnel-ip invalido."
+        ALLOWED=$(normalize_list "$ALLOWED, $(host_prefix "$SRV_TIP")" valid_cidr)
+    fi
+    DNS=""
+    if [ -n "$DNS_IN" ]; then DNS=$(normalize_list "$DNS_IN" valid_ip) || cli_die "--dns invalido."; fi
+    valid_keepalive "$KA" || cli_die "--keepalive invalido."
+    if [ -n "$MTU" ]; then valid_mtu "$MTU" || cli_die "--mtu invalido (1280-9000)."; fi
+    PSK=""
+    if [ -n "$PSK_FILE" ]; then
+        [ -r "$PSK_FILE" ] || cli_die "--psk-file ilegivel."
+        PSK=$(tr -d ' \t\r\n' < "$PSK_FILE")
+    elif [ "$PSK_STDIN" -eq 1 ]; then
+        IFS= read -r PSK || true
+        PSK=$(printf '%s' "$PSK" | tr -d ' \t\r\n')
+    fi
+    if [ -n "$PSK" ]; then valid_wgkey "$PSK" || cli_die "PSK invalida."; fi
+
+    _conf_w=$(route_conflicts "$ALLOWED")
+    if [ -n "$_conf_w" ]; then
+        msg_warn "AllowedIPs sobrepoe rotas locais:" >&2
+        printf '%s\n' "$_conf_w" >&2
+        [ "$STRICT" -eq 1 ] && cli_die "Abortado por --strict."
+    fi
+
+    mkdir -p "$WG_DIR" && chmod 700 "$WG_DIR"
+    _dir="$WG_DIR/$TUN"; _conf="$_dir/$TUN.conf"
+    _changed=0
+    if tunnel_exists "$TUN"; then
+        # Converge: mantem a chave privada existente, compara o conteudo efetivo
+        _new="$_dir/.desired.tmp"
+        render_conf "$_dir/privatekey" > "$_new"
+        if [ "$(grep -v '^# Gerado' "$_new")" = "$(grep -v '^# Gerado' "$_conf")" ]; then
+            rm -f "$_new"
+        else
+            _bk=$(backup_tunnel "$TUN" antes-cli-update) || { rm -f "$_new"; cli_die "Falha no backup." 2; }
+            mv "$_new" "$_conf" && chmod 600 "$_conf"
+            if [ -n "$PSK" ]; then printf '%s\n' "$PSK" > "$_dir/presharedkey"; else rm -f "$_dir/presharedkey"; fi
+            msg_info "Configuracao atualizada (backup: $_bk)." >&2
+            _changed=1
+            if tunnel_is_up "$TUN"; then wg-quick down "$TUN" >/dev/null 2>&1; wg-quick up "$TUN" >/dev/null 2>&1 || cli_die "Falha ao reiniciar $TUN." 2; fi
+        fi
+    else
+        [ -e "$_dir" ] && cli_die "$_dir existe mas nao e um tunel valido. Remova manualmente." 2
+        ip link show "$TUN" >/dev/null 2>&1 && cli_die "Ja existe interface de rede '$TUN'."
+        mkdir -m 700 "$_dir" || cli_die "Falha ao criar $_dir" 2
+        if ! { wg genkey > "$_dir/privatekey" && wg pubkey < "$_dir/privatekey" > "$_dir/publickey"; }; then
+            rm -rf "$_dir"; cli_die "Falha ao gerar chaves." 2
+        fi
+        [ -n "$PSK" ] && printf '%s\n' "$PSK" > "$_dir/presharedkey"
+        render_conf "$_dir/privatekey" > "$_conf"
+        chmod 600 "$_dir"/*
+        ln -s "$TUN/$TUN.conf" "$WG_DIR/$TUN.conf"
+        _changed=1
+    fi
+    PSK=""
+
+    if [ "$OPT_MON" -eq 1 ]; then
+        _dd=1; valid_ip "$_h" && _dd=0
+        _wd=1; [ "$KA" -eq 0 ] && _wd=0
+        _mc=$(printf 'ENABLED=1\nHS_MAX=180\nDDNS=%s\nWATCHDOG=%s\nBACKOFF=300' "$_dd" "$_wd")
+        if [ "$(cat "$_dir/monitor.conf" 2>/dev/null)" != "$_mc" ]; then
+            printf '%s\n' "$_mc" > "$_dir/monitor.conf"; chmod 600 "$_dir/monitor.conf"; _changed=1
+        fi
+        agent_installed || { install_agent >&2 && _changed=1; }
+    fi
+    if [ "$OPT_UP" -eq 1 ] && ! tunnel_is_up "$TUN"; then
+        rm -f "$_dir/.admin-down"
+        wg-quick up "$TUN" >/dev/null 2>&1 || cli_die "Falha ao subir $TUN." 2
+        _changed=1
+    fi
+    if [ "$OPT_BOOT" -eq 1 ] && [ "$(init_system)" = "systemd" ] && ! systemctl is-enabled --quiet "wg-quick@$TUN" 2>/dev/null; then
+        systemctl enable "wg-quick@$TUN" >/dev/null 2>&1 && _changed=1
+    fi
+
+    if [ "$_changed" -eq 1 ]; then echo "STATUS=changed"; else echo "STATUS=unchanged"; fi
+    echo "PUBKEY=$(tr -d ' \t\r\n' < "$_dir/publickey")"
+}
+
+cli_main() {
+    ACTION=""; TUN=""; EP_ARG=""; SRV_PUB=""; ADDR_IN=""; ALLOWED_IN=""; SRV_TIP=""
+    PSK_FILE=""; PSK_STDIN=0; DNS_IN=""; KA=25; MTU=""; OPT_UP=0; OPT_BOOT=0; OPT_MON=0; STRICT=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --create) ACTION=create ;;
+            --name|--endpoint|--server-pubkey|--address|--allowed-ips|--server-tunnel-ip|--psk-file|--dns|--keepalive|--mtu|--show-pubkey|--diagnose)
+                [ $# -ge 2 ] || cli_die "$1 requer um valor."
+                case "$1" in
+                    --name) TUN=$2 ;; --endpoint) EP_ARG=$2 ;; --server-pubkey) SRV_PUB=$2 ;;
+                    --address) ADDR_IN=$2 ;; --allowed-ips) ALLOWED_IN=$2 ;; --server-tunnel-ip) SRV_TIP=$2 ;;
+                    --psk-file) PSK_FILE=$2 ;; --dns) DNS_IN=$2 ;; --keepalive) KA=$2 ;; --mtu) MTU=$2 ;;
+                    --show-pubkey) ACTION=pubkey; TUN=$2 ;; --diagnose) ACTION=diagnose; TUN=$2 ;;
+                esac
+                shift ;;
+            --psk|--psk=*|--private-key*) cli_die "Segredo como argumento e proibido (fica visivel no ps/historico). Use --psk-file ou --psk-stdin." ;;
+            --psk-stdin) PSK_STDIN=1 ;;
+            --up) OPT_UP=1 ;; --boot) OPT_BOOT=1 ;; --monitor) OPT_MON=1 ;; --strict) STRICT=1 ;;
+            --list) ACTION=list ;;
+            --maintenance) ACTION=maint ;;
+            --install) ACTION=install ;;
+            --version) echo "wg-client-manager v$VERSION"; exit 0 ;;
+            --help|-h) usage; exit 0 ;;
+            *) cli_die "Opcao desconhecida: $1 (veja --help)" ;;
+        esac
+        shift
+    done
+    require_root
+    case "$ACTION" in
+        create)   wg_installed || cli_die "WireGuard nao instalado (use --install)." 2; cli_create ;;
+        pubkey)   tunnel_exists "$TUN" || cli_die "Tunel '$TUN' nao encontrado."; tr -d ' \t\r\n' < "$WG_DIR/$TUN/publickey"; echo ;;
+        list)     list_clients ;;
+        diagnose) tunnel_exists "$TUN" || cli_die "Tunel '$TUN' nao encontrado."; diagnose_tunnel "$TUN" ;;
+        maint)    wg_installed || exit 0; run_maintenance ;;
+        install)  install_wg || exit 2 ;;
+        *)        cli_die "Nenhuma acao informada (veja --help)." ;;
     esac
 }
 
@@ -1301,8 +2078,10 @@ header() {
     printf '11) Rotacionar par de chaves do cliente\n'
     printf '12) Atualizar PSK (gerada no servidor)\n'
     printf '13) Exibir configuracao (chaves ocultas)\n'
-    printf '14) Debug / troubleshooting (log detalhado)\n'
-    printf '15) Remover cliente\n'
+    printf '14) Debug / troubleshooting (log detalhado, MTU)\n'
+    printf '15) Monitoramento automatico (DDNS + watchdog)\n'
+    printf '16) Backups e rollback\n'
+    printf '17) Remover cliente\n'
     printf ' 0) Sair\n'
     printf -- '-----------------------------------------------------\n'
 }
@@ -1314,6 +2093,10 @@ need_wg() {
 }
 
 main() {
+    if [ $# -gt 0 ]; then
+        cli_main "$@"
+        exit $?
+    fi
     require_root
     while :; do
         header
@@ -1333,7 +2116,9 @@ main() {
            12) need_wg && update_psk ;;
            13) show_conf_masked ;;
            14) debug_menu ;;
-           15) need_wg && remove_client ;;
+           15) monitor_menu ;;
+           16) rollback_tunnel ;;
+           17) need_wg && remove_client ;;
             0) exit 0 ;;
             *) msg_err "Opcao invalida." ;;
         esac
