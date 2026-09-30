@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # wg-client-manager.sh
-# Versao    : 1.3.0 (2026-09-29)
+# Versao    : 1.4.1 (2026-09-29)
 # Projeto   : EdenCore - Comunidade de Infraestrutura de TI
 # Instrutor : Daniel Selbach Figueiró
 # Funcao    : criar e gerenciar clientes WireGuard (wg-quick) via menu interativo.
@@ -25,6 +25,14 @@
 #          - Rotacao do par de chaves com comando "set" pronto p/ o servidor.
 #          - Atualizacao de PSK sem expor o segredo.
 #          - Exibicao do .conf com chaves ocultas (suporte sem vazamento).
+#   1.4.0  Modulo de debug/troubleshooting:
+#          - Log detalhado do modulo WireGuard do kernel (dynamic debug).
+#          - Captura guiada com relatorio: kernel log, UDP (tcpdump),
+#            amostras de handshake/transfer, rotas e analise automatica.
+#          - Acompanhamento ao vivo; debug sempre desligado ao sair.
+#   1.4.1  Destino dos logs sempre informado na tela (antes e depois da
+#          captura); gravacao opcional do modo ao vivo em arquivo; listar e
+#          exibir relatorios salvos. Nenhum log sai da maquina.
 #
 # Seguranca por Design:
 #   - Executa somente como root; umask 077 em todo o fluxo (pastas 700, arquivos 600).
@@ -56,8 +64,11 @@ umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-VERSION="1.3.0"
+VERSION="1.4.1"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
+LOG_DIR="${WG_LOG_DIR:-/var/log/wg-client-manager}"
+DYN_CTRL="/sys/kernel/debug/dynamic_debug/control"
+DEBUG_ACTIVE=0
 
 # ----------------------------------------------------------------------------
 # Saida
@@ -75,7 +86,16 @@ msg_warn() { printf '%s[AVISO]%s %s\n' "$C_Y" "$C_N" "$1"; }
 msg_info() { printf '%s[INFO]%s %s\n'  "$C_B" "$C_N" "$1"; }
 
 restore_tty() { stty echo 2>/dev/null || true; }
-trap 'restore_tty; printf "\n"; exit 130' INT TERM
+
+# Debug do kernel nunca fica ligado por esquecimento: desligado em qualquer saida.
+debug_off() {
+    if [ "$DEBUG_ACTIVE" -eq 1 ] && [ -e "$DYN_CTRL" ]; then
+        echo 'module wireguard -p' > "$DYN_CTRL" 2>/dev/null
+    fi
+    DEBUG_ACTIVE=0
+}
+trap 'debug_off' EXIT
+trap 'restore_tty; debug_off; printf "\n"; exit 130' INT TERM
 
 pause() {
     printf '\nPressione Enter para continuar...'
@@ -894,6 +914,366 @@ remove_client() {
 }
 
 # ----------------------------------------------------------------------------
+# Debug / troubleshooting
+# ----------------------------------------------------------------------------
+# O modulo WireGuard do kernel so registra eventos de handshake, keepalive e
+# pacotes rejeitados quando o dynamic debug esta ativo. Sem ele o WireGuard e
+# silencioso por design. Requer CONFIG_DYNAMIC_DEBUG e debugfs acessivel
+# (Secure Boot com kernel lockdown bloqueia a escrita no debugfs).
+
+lockdown_state() {
+    [ -r /sys/kernel/security/lockdown ] || { printf 'n/d'; return; }
+    sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/security/lockdown
+}
+
+debug_on() {
+    [ -d /sys/module/wireguard ] || modprobe wireguard >/dev/null 2>&1
+    if [ ! -e "$DYN_CTRL" ]; then
+        mount -t debugfs none /sys/kernel/debug >/dev/null 2>&1
+    fi
+    if [ ! -e "$DYN_CTRL" ]; then
+        msg_warn "Dynamic debug indisponivel (kernel sem CONFIG_DYNAMIC_DEBUG ou debugfs ausente)."
+        return 1
+    fi
+    if echo 'module wireguard +p' > "$DYN_CTRL" 2>/dev/null; then
+        DEBUG_ACTIVE=1
+        return 0
+    fi
+    msg_warn "Escrita no dynamic debug negada. Kernel lockdown: $(lockdown_state)."
+    msg_warn "Com Secure Boot ativo o log do kernel fica indisponivel; a captura UDP continua valida."
+    return 1
+}
+
+debug_status() {
+    printf '\n--- Status do debug ---\n'
+    print_log_destinations
+    msg_info "Kernel lockdown: $(lockdown_state)"
+    if [ ! -e "$DYN_CTRL" ]; then
+        msg_info "Dynamic debug: nao montado/disponivel."
+    else
+        _n=$(grep -c 'wireguard.*=p' "$DYN_CTRL" 2>/dev/null)
+        if [ "${_n:-0}" -gt 0 ]; then
+            msg_warn "Debug WireGuard ATIVO no kernel ($_n pontos). Desative ao terminar."
+        else
+            msg_ok "Debug WireGuard desativado."
+        fi
+    fi
+    if command -v tcpdump >/dev/null 2>&1; then msg_ok "tcpdump disponivel."
+    else msg_info "tcpdump ausente (instalado sob demanda na captura guiada)."; fi
+    _nlog=$(find "$LOG_DIR" -type f -name '*.log' 2>/dev/null | wc -l)
+    msg_info "Relatorios em $LOG_DIR: ${_nlog:-0}"
+}
+
+debug_force_off() {
+    [ -e "$DYN_CTRL" ] && echo 'module wireguard -p' > "$DYN_CTRL" 2>/dev/null
+    DEBUG_ACTIVE=0
+    msg_ok "Debug WireGuard desativado no kernel."
+}
+
+ensure_tcpdump() {
+    command -v tcpdump >/dev/null 2>&1 && return 0
+    confirm "tcpdump nao instalado. Instalar agora (recomendado para a captura)?" || return 1
+    _pm=$(detect_pm) || { msg_err "Gerenciador de pacotes nao suportado."; return 1; }
+    case "$_pm" in
+        apt-get)      DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump ;;
+        dnf|yum)      "$_pm" install -y tcpdump ;;
+        zypper)       zypper --non-interactive install tcpdump ;;
+        pacman)       pacman -S --noconfirm --needed tcpdump ;;
+        apk)          apk add --no-cache tcpdump ;;
+        xbps-install) xbps-install -y tcpdump ;;
+        emerge)       emerge --ask=n net-analyzer/tcpdump ;;
+    esac >/dev/null 2>&1
+    command -v tcpdump >/dev/null 2>&1
+}
+
+# Leitura do log do kernel desde um instante (journalctl) ou por diferenca de linhas (dmesg)
+kernel_log_since() {
+    if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        journalctl -k --since "@$1" --no-pager -o short-precise 2>/dev/null | grep -i 'wireguard'
+    else
+        dmesg 2>/dev/null | tail -n +"$(( $2 + 1 ))" | grep -i 'wireguard'
+    fi
+}
+
+mask_secrets() {
+    sed -E -e 's/^(PrivateKey|PresharedKey)[[:space:]]*=.*/\1 = <oculta>/' \
+           -e 's/(private key|preshared key):.*/\1: (oculta)/'
+}
+
+# analyze_capture KLOG UDPLOG EP_IP EP_PORT HANDSHAKE_OK PING_OK PING_TOTAL SIP
+analyze_capture() {
+    _k=$1; _u=$2; _eip=$3; _ep=$4; _hsok=$5; _pok=$6; _ptot=$7; _sip=$8
+    _init=$(grep -c 'Sending handshake initiation' "$_k" 2>/dev/null)
+    _resp=$(grep -c 'Receiving handshake response' "$_k" 2>/dev/null)
+    _inv=$(grep -c 'Invalid handshake' "$_k" 2>/dev/null)
+    _kp=$(grep -c 'Keypair .* created' "$_k" 2>/dev/null)
+    _unal=$(grep -c 'unallowed src IP' "$_k" 2>/dev/null)
+    _noep=$(grep -c 'No valid endpoint' "$_k" 2>/dev/null)
+    _klines=$(wc -l < "$_k" 2>/dev/null)
+    _out=0; _in=0; _in92=0; _out148=0
+    if [ -s "$_u" ]; then
+        _out=$(grep -cF "> $_eip.$_ep:" "$_u")
+        _in=$(grep -cF "$_eip.$_ep >" "$_u")
+        _out148=$(grep -F "> $_eip.$_ep:" "$_u" | grep -c 'length 148')
+        _in92=$(grep -F "$_eip.$_ep >" "$_u" | grep -c 'length 92')
+    fi
+
+    printf 'Kernel : iniciacoes=%s respostas=%s invalidos=%s keypairs=%s unallowed_src=%s sem_endpoint=%s (linhas=%s)\n' \
+        "${_init:-0}" "${_resp:-0}" "${_inv:-0}" "${_kp:-0}" "${_unal:-0}" "${_noep:-0}" "${_klines:-0}"
+    printf 'UDP    : saindo=%s (iniciacao 148B=%s) | chegando=%s (resposta 92B=%s)\n' \
+        "$_out" "$_out148" "$_in" "$_in92"
+    [ -n "$_sip" ] && printf 'Ping   : %s/%s respostas de %s\n' "$_pok" "$_ptot" "$_sip"
+    printf '\n'
+
+    _found=0
+    if [ "$_hsok" -eq 1 ] || [ "${_kp:-0}" -gt 0 ]; then
+        printf '[OK] Handshake estabelecido.\n'; _found=1
+        if [ -n "$_sip" ] && [ "$_pok" -eq 0 ]; then
+            printf '[CAUSA] Tunel OK, mas %s nao responde: firewall input/ICMP no servidor\n' "$_sip"
+            printf '        ou IP do servidor no tunel diferente de %s.\n' "$_sip"
+        fi
+    else
+        if [ "${_inv:-0}" -gt 0 ] || [ "$_in92" -gt 0 ]; then
+            printf '[CAUSA] O servidor RESPONDE, mas a resposta e rejeitada pelo cliente.\n'
+            printf '        Provavel: PSK divergente entre as pontas, ou PublicKey do servidor\n'
+            printf '        errada no [Peer] do cliente.\n'; _found=1
+        elif [ "$_out" -gt 0 ] || [ "${_init:-0}" -gt 0 ]; then
+            if [ "$_in" -eq 0 ]; then
+                printf '[CAUSA] Iniciacoes saem e NENHUM pacote volta do servidor.\n'
+                printf '        Provavel: chave publica do cliente ausente/errada no peer do servidor,\n'
+                printf '        UDP %s bloqueado no caminho, ou endpoint/porta incorretos.\n' "$_ep"; _found=1
+            fi
+        fi
+        if [ "${_noep:-0}" -gt 0 ]; then
+            printf '[CAUSA] Peer sem endpoint valido: verifique Endpoint e resolucao DNS/DDNS.\n'; _found=1
+        fi
+    fi
+    if [ "${_unal:-0}" -gt 0 ]; then
+        printf '[CAUSA] Pacotes com IP de origem fora do AllowedIPs do cliente foram descartados.\n'
+        printf '        Inclua a rede de origem no AllowedIPs ou revise NAT/masquerade no servidor.\n'; _found=1
+    fi
+    if [ "$_found" -eq 0 ]; then
+        printf '[INFO] Sem evidencia conclusiva. Aumente a duracao da captura ou habilite\n'
+        printf '       o log do lado do servidor (comandos abaixo).\n'
+    fi
+    if [ "${_klines:-0}" -eq 0 ] && [ ! -s "$_u" ]; then
+        printf '[AVISO] Sem log do kernel e sem captura UDP: analise limitada.\n'
+    fi
+}
+
+debug_capture() {
+    select_tunnel _dt || return 1
+    while :; do
+        ask _dur "Duracao da captura em segundos (10-600)" "30"
+        case "$_dur" in ''|*[!0-9]*) ;; *) [ "$_dur" -ge 10 ] && [ "$_dur" -le 600 ] && break ;; esac
+        msg_err "Informe um valor entre 10 e 600."
+    done
+    _restart=0
+    confirm "Reiniciar o tunel no inicio (registra o handshake desde o zero)?" && _restart=1
+
+    mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+    _stamp=$(date '+%Y%m%d-%H%M%S')
+    _log="$LOG_DIR/${_dt}-${_stamp}.log"
+    _klog="$LOG_DIR/.${_dt}-${_stamp}.klog"
+    _ulog="$LOG_DIR/.${_dt}-${_stamp}.udp"
+    : > "$_log"; : > "$_klog"; : > "$_ulog"
+
+    _kdebug=0; debug_on && _kdebug=1
+    _t0=$(date +%s)
+    _dm0=$(dmesg 2>/dev/null | wc -l)
+
+    if [ "$_restart" -eq 1 ] && tunnel_is_up "$_dt"; then
+        wg-quick down "$_dt" >> "$_log" 2>&1
+    fi
+    tunnel_is_up "$_dt" || wg-quick up "$_dt" >> "$_log" 2>&1
+
+    _epraw=$(wg show "$_dt" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+    _eport=${_epraw##*:}
+    _eip=${_epraw%:*}; _eip=${_eip#[}; _eip=${_eip%]}
+    _sip=$(server_tunnel_ip "$_dt")
+
+    _tpid=""
+    if [ -n "$_eip" ] && [ "$_eip" != "(none)" ] && ensure_tcpdump; then
+        tcpdump -l -nn -i any "udp and host $_eip and port $_eport" > "$_ulog" 2>/dev/null &
+        _tpid=$!
+    fi
+
+    printf '\n'
+    msg_info "Relatorio sera salvo em: $_log"
+    msg_info "Eventos do kernel tambem ficam em: $(kernel_log_source)"
+    msg_info "Capturando por ${_dur}s (kernel debug: $([ "$_kdebug" -eq 1 ] && echo sim || echo nao) | tcpdump: $([ -n "$_tpid" ] && echo sim || echo nao))"
+    # Janela controlada por relogio: o tempo real da captura nao depende do RTT do ping.
+    _pok=0; _ptot=0; _samples=""; _next=5
+    _tend=$(( $(date +%s) + _dur ))
+    while [ "$(date +%s)" -lt "$_tend" ]; do
+        if [ -n "$_sip" ]; then
+            _ptot=$((_ptot + 1))
+            ping -c1 -W1 "$_sip" >/dev/null 2>&1 && _pok=$((_pok + 1))
+        fi
+        sleep 1
+        _i=$(( $(date +%s) - _t0 ))
+        if [ "$_i" -ge "$_next" ]; then
+            _next=$((_next + 5))
+            _hs=$(wg show "$_dt" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+            _tr=$(wg show "$_dt" transfer 2>/dev/null | awk 'NR==1{print "rx=" $2 "B tx=" $3 "B"}')
+            _samples="${_samples}t+${_i}s handshake_epoch=${_hs:-0} ${_tr}
+"
+            printf '.'
+        fi
+    done
+    printf '\n'
+
+    [ -n "$_tpid" ] && { kill "$_tpid" 2>/dev/null; wait "$_tpid" 2>/dev/null; }
+    debug_off
+    kernel_log_since "$_t0" "$_dm0" > "$_klog"
+
+    _hs=$(wg show "$_dt" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+    _hsok=0
+    [ "${_hs:-0}" -ge "$_t0" ] 2>/dev/null && _hsok=1
+    [ "${_hs:-0}" -gt 0 ] && [ $(( $(date +%s) - _hs )) -le 180 ] && _hsok=1
+
+    _analysis=$(analyze_capture "$_klog" "$_ulog" "$_eip" "$_eport" "$_hsok" "$_pok" "$_ptot" "$_sip")
+    _pub=$(tr -d ' \t\r\n' < "$WG_DIR/$_dt/publickey")
+
+    {
+        printf '=====================================================\n'
+        printf ' Relatorio de debug WireGuard | tunel %s | %s\n' "$_dt" "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf ' wg-client-manager.sh v%s | duracao %ss | restart=%s\n' "$VERSION" "$_dur" "$_restart"
+        printf '=====================================================\n\n'
+        printf '== Analise automatica ==\n%s\n\n' "$_analysis"
+        printf '== Ambiente ==\n'
+        printf 'OS: %s\n' "$( (. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-n/d}") )"
+        printf 'Kernel: %s | lockdown: %s | init: %s\n' "$(uname -r)" "$(lockdown_state)" "$(init_system)"
+        printf 'wg: %s\n' "$(wg --version 2>/dev/null | head -n1)"
+        printf 'Kernel debug: %s | tcpdump: %s\n\n' "$_kdebug" "$([ -n "$_tpid" ] && echo 1 || echo 0)"
+        printf '== Configuracao (chaves ocultas) ==\n'
+        mask_secrets < "$WG_DIR/$_dt/$_dt.conf"
+        printf '\n== Estado WireGuard (final) ==\n'
+        wg show "$_dt" 2>&1 | mask_secrets
+        printf '\n== Amostras a cada 5s ==\n%s\n' "$_samples"
+        printf '== Interface e rotas ==\n'
+        ip addr show dev "$_dt" 2>&1
+        ip route show dev "$_dt" 2>&1
+        if [ -n "$_eip" ] && [ "$_eip" != "(none)" ]; then
+            printf 'Rota ate o endpoint: %s\n' "$(ip route get "$_eip" 2>&1 | head -n1)"
+            _odev=$(ip route get "$_eip" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)
+            [ -n "$_odev" ] && printf 'MTU %s: %s | MTU %s: %s\n' "$_odev" \
+                "$(cat /sys/class/net/"$_odev"/mtu 2>/dev/null)" "$_dt" "$(cat /sys/class/net/"$_dt"/mtu 2>/dev/null)"
+        fi
+        printf '\n== Captura UDP (%s:%s) ==\n' "$_eip" "$_eport"
+        if [ -s "$_ulog" ]; then cat "$_ulog"; else printf '(sem pacotes ou tcpdump indisponivel)\n'; fi
+        printf '\n== Log do kernel (wireguard) ==\n'
+        if [ -s "$_klog" ]; then cat "$_klog"; else printf '(vazio: debug indisponivel ou sem eventos)\n'; fi
+        printf '\n== Lado servidor (MikroTik RouterOS v7) ==\n'
+        printf '/interface wireguard peers print detail where public-key="%s"\n' "$_pub"
+        printf '/system logging add topics=wireguard,debug action=memory\n'
+        printf '/log print where topics~"wireguard"\n'
+        printf '/system logging remove [find topics~"wireguard"]   # desligar ao terminar\n'
+    } >> "$_log" 2>&1
+
+    rm -f "$_klog" "$_ulog"
+    chmod 600 "$_log"
+
+    printf '\n--- Analise automatica ---\n%s\n\n' "$_analysis"
+    msg_ok "Relatorio completo: $_log"
+    msg_info "Chaves privadas e PSK ficam ocultas no relatorio. Chaves publicas e IPs aparecem."
+}
+
+kernel_log_source() {
+    if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        printf 'journal do systemd (consulta: journalctl -k | grep -i wireguard)'
+    elif dmesg --help 2>&1 | grep -q -- '--follow'; then
+        printf 'ring buffer do kernel (consulta: dmesg | grep -i wireguard)'
+    elif [ -r /var/log/messages ]; then
+        printf '/var/log/messages (consulta: grep -i wireguard /var/log/messages)'
+    else
+        printf 'ring buffer do kernel (consulta: dmesg | grep -i wireguard)'
+    fi
+}
+
+print_log_destinations() {
+    printf 'Destino dos logs (tudo fica local, nada e enviado para fora da maquina):\n'
+    printf '  Relatorios do script : %s/  (pasta 700, arquivos 600)\n' "$LOG_DIR"
+    printf '  Eventos do kernel    : %s\n' "$(kernel_log_source)"
+}
+
+list_reports() {
+    printf '\n--- Relatorios salvos em %s ---\n' "$LOG_DIR"
+    if [ -z "$(find "$LOG_DIR" -maxdepth 1 -type f -name '*.log' 2>/dev/null | head -n1)" ]; then
+        msg_info "Nenhum relatorio salvo."
+        return 0
+    fi
+    # shellcheck disable=SC2012
+    ls -lt "$LOG_DIR"/*.log 2>/dev/null | awk '{printf "  %s %s %s  %8s B  %s\n", $6, $7, $8, $5, $9}'
+}
+
+show_last_report() {
+    # shellcheck disable=SC2012
+    _last=$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -n1)
+    if [ -z "$_last" ]; then
+        msg_info "Nenhum relatorio salvo em $LOG_DIR."
+        return 0
+    fi
+    msg_info "Exibindo: $_last"
+    if command -v less >/dev/null 2>&1 && [ -t 1 ]; then less "$_last"; else cat "$_last"; fi
+}
+
+debug_live() {
+    if ! debug_on; then
+        msg_err "Sem debug do kernel nao ha o que acompanhar ao vivo. Use a captura guiada (tcpdump)."
+        return 1
+    fi
+    _lf="/dev/null"
+    if confirm "Gravar tambem em arquivo?"; then
+        mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+        _lf="$LOG_DIR/live-$(date '+%Y%m%d-%H%M%S').log"
+        : > "$_lf" && chmod 600 "$_lf"
+    fi
+    printf '\n'
+    msg_info "Fonte : $(kernel_log_source)"
+    if [ "$_lf" != "/dev/null" ]; then
+        msg_info "Arquivo: $_lf"
+    else
+        msg_info "Arquivo: nao gravado (somente tela)"
+    fi
+    msg_info "Ctrl+C encerra e desativa o debug automaticamente."
+    printf '\n'
+    if command -v journalctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        journalctl -kf -n0 -o short-precise | grep -i 'wireguard' | tee -a "$_lf"
+    elif dmesg --help 2>&1 | grep -q -- '--follow'; then
+        dmesg -w | grep -i 'wireguard' | tee -a "$_lf"
+    elif [ -r /var/log/messages ]; then
+        tail -n0 -f /var/log/messages | grep -i 'wireguard' | tee -a "$_lf"
+    else
+        msg_err "Nenhuma fonte de log do kernel com acompanhamento disponivel."
+    fi
+    debug_off
+}
+
+debug_menu() {
+    printf '\n--- Debug / Troubleshooting ---\n'
+    print_log_destinations
+    printf -- '-----------------------------------------------------\n'
+    printf ' 1) Captura guiada com relatorio (recomendado)\n'
+    printf ' 2) Acompanhar log do kernel ao vivo\n'
+    printf ' 3) Listar relatorios salvos\n'
+    printf ' 4) Exibir ultimo relatorio\n'
+    printf ' 5) Status do debug\n'
+    printf ' 6) Forcar desativacao do debug\n'
+    printf ' 0) Voltar\n'
+    ask _dopt "Opcao"
+    case "$_dopt" in
+        1) need_wg && debug_capture ;;
+        2) debug_live ;;
+        3) list_reports ;;
+        4) show_last_report ;;
+        5) debug_status ;;
+        6) debug_force_off ;;
+        *) : ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
 # Menu
 # ----------------------------------------------------------------------------
 header() {
@@ -921,7 +1301,8 @@ header() {
     printf '11) Rotacionar par de chaves do cliente\n'
     printf '12) Atualizar PSK (gerada no servidor)\n'
     printf '13) Exibir configuracao (chaves ocultas)\n'
-    printf '14) Remover cliente\n'
+    printf '14) Debug / troubleshooting (log detalhado)\n'
+    printf '15) Remover cliente\n'
     printf ' 0) Sair\n'
     printf -- '-----------------------------------------------------\n'
 }
@@ -951,7 +1332,8 @@ main() {
            11) need_wg && rotate_keys ;;
            12) need_wg && update_psk ;;
            13) show_conf_masked ;;
-           14) need_wg && remove_client ;;
+           14) debug_menu ;;
+           15) need_wg && remove_client ;;
             0) exit 0 ;;
             *) msg_err "Opcao invalida." ;;
         esac
